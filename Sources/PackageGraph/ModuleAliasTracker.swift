@@ -1,4 +1,5 @@
 import PackageModel
+import Basics
 
 // This class helps track module aliases in a package graph and override
 // upstream alises if needed
@@ -98,7 +99,7 @@ class ModuleAliasTracker {
         }
     }
 
-    func propagateAliases() {
+    func propagateAliases(observabilityScope: ObservabilityScope) {
         // First get the root package ID
         var pkgID = childToParentID.first?.key
         var rootPkg = pkgID
@@ -111,11 +112,12 @@ class ModuleAliasTracker {
         // Propagate and override upstream aliases if needed
         var aliasBuffer = [String: ModuleAliasModel]()
         propagate(package: rootPkg, aliasBuffer: &aliasBuffer)
+
         // Now merge overriden upstream aliases and add them to
         // downstream targets
         if let productToAllTargets = idToProductToAllTargets[rootPkg] {
             for productID in productToAllTargets.keys {
-                mergeAliases(productID: productID)
+                mergeAliases(productID: productID, observabilityScope: observabilityScope)
             }
         }
     }
@@ -130,11 +132,22 @@ class ModuleAliasTracker {
                 // aliases for targets; if the downstream aliases are applied
                 // to upstream targets, then they get removed
                 if aliasBuffer[aliasModel.name] == nil {
-                    // Add a target name as a key. The buffer only tracks
-                    // a target that needs to be renamed, not the depending
-                    // targets which might have multiple target dependencies
-                    // with their aliases, so add a single alias model as value.
-                    aliasBuffer[aliasModel.name] = aliasModel
+                    // First look up if there's an alias to be overriden,
+                    // e.g. upstream has `moduleAliases: [Utils: FooUtils]`,
+                    // and downstream has `moduleAliases: [FooUtils: BarUtils]`,
+                    // then we want to add [Utils: BarUtils] to the buffer
+                    // to track. Both [Utils: FooUtils] and [FooUtils: BarUtils]
+                    // are also added to the buffer.
+                    var next = aliasModel.alias
+                    while let nextValue = aliasBuffer[next] {
+                        next = nextValue.alias
+                    }
+                    if next != aliasModel.alias {
+                        let chainedModel = ModuleAliasModel(name: aliasModel.name, alias: next, originPackage: aliasModel.originPackage, consumingPackage: aliasModel.consumingPackage)
+                        aliasBuffer[aliasModel.name] = chainedModel
+                    } else {
+                        aliasBuffer[aliasModel.name] = aliasModel
+                    }
                 }
             }
         }
@@ -151,10 +164,23 @@ class ModuleAliasTracker {
                                 var didAlias = false
                                 for curTarget in targetsForCurProduct {
                                     // Check if curTarget is relevant for aliasing
-                                    let canAlias = curTarget.name == aliasModel.name || curTarget.dependencies.contains { $0.name == aliasModel.name }
-                                    if canAlias {
+                                    let canAliasTarget = curTarget.name == aliasModel.name || curTarget.dependencies.contains { $0.name == aliasModel.name }
+                                    if canAliasTarget {
                                         curTarget.addModuleAlias(for: aliasModel.name, as: aliasModel.alias)
                                         didAlias = true
+                                    }
+                                    // Check if curTarget needs pre-chained aliases
+                                    // from its dependency products.
+                                    let depProductAliases = curTarget.dependencies.compactMap{$0.product?.moduleAliases}.flatMap{$0}
+                                    let depAliasesWithDuplicateKeys = depProductAliases.filter{$0.key == aliasModel.name}
+                                    let usePreChainedAliases = (didAlias && !depAliasesWithDuplicateKeys.isEmpty) ||  depAliasesWithDuplicateKeys.count > 1
+
+                                    if usePreChainedAliases {
+                                        for depAlias in depProductAliases {
+                                            if let preChainedAlias = aliasBuffer[depAlias.value] {
+                                                curTarget.addModuleAlias(for: preChainedAlias.name, as: preChainedAlias.alias)
+                                            }
+                                        }
                                     }
                                 }
                                 if didAlias {
@@ -170,17 +196,20 @@ class ModuleAliasTracker {
                 }
             }
         }
-        guard let children = parentToChildIDs[package] else { return }
+        guard let children = parentToChildIDs[package] else {
+            aliasBuffer.removeAll()
+            return
+        }
         for childID in children {
             propagate(package: childID, aliasBuffer: &aliasBuffer)
         }
     }
 
     // Merge overriden upstream aliases and add them to downstream targets
-    func mergeAliases(productID: String) {
+    func mergeAliases(productID: String, observabilityScope: ObservabilityScope) {
         guard let childProducts = parentToChildProducts[productID] else { return }
         for child in childProducts {
-            mergeAliases(productID: child)
+            mergeAliases(productID: child, observabilityScope: observabilityScope)
             // Filter out targets in the current product with names that are
             // aliased with different values in the child products since they
             // should either not be aliased or their existing aliases if any
@@ -197,21 +226,25 @@ class ModuleAliasTracker {
                 relevantTargets.append(contentsOf: directTargets)
                 relevantTargets.append(contentsOf: directRelevantTargets)
                 let relevantTargetSet = Set(relevantTargets)
-
                 // Used to compare with aliases defined in other child products
                 // and detect a conflict if any.
                 let allTargetsInOtherChildProducts = childProducts.filter{$0 != child }.compactMap{productToAllTargets[$0]}.flatMap{$0}
-                let allTargetNamesInChildProduct = productToAllTargets[child]?.map{$0.name} ?? []
+                let allTargetNamesInCurChildProduct = productToAllTargets[child]?.map{$0.name} ?? []
                 for curTarget in relevantTargetSet {
-                    for (nameToBeAliased, aliasInChild) in childTargetsAliases {
-                        // If there are targets in other child products that
-                        // have the same name that's being aliased here, but
-                        // targets in this child product don't, we need to use
-                        // alias values of those targets as they take a precedence
-                        let otherAliasesInChildProducts = allTargetsInOtherChildProducts.filter{$0.name == nameToBeAliased}.compactMap{$0.moduleAliases}.flatMap{$0}.filter{$0.key == nameToBeAliased}
-                        if !otherAliasesInChildProducts.isEmpty,
-                           !allTargetNamesInChildProduct.contains(curTarget.name) {
-                            for (aliasKey, aliasValue) in otherAliasesInChildProducts {
+                    for (nameToBeAliased, aliasInCurChild) in childTargetsAliases {
+                        // Look up targets in other child products that have the
+                        // name `nameToBeAliased` but are aliased with values
+                        // conflicting with `aliasInCurChild`
+                        let aliasesForTargetsRenamedInOtherChildProducts = allTargetsInOtherChildProducts.filter{$0.name == nameToBeAliased}.compactMap{$0.moduleAliases}.flatMap{$0}.filter{$0.key == nameToBeAliased}
+                        let hasConflictingAliasesForTargetsRenamed = aliasesForTargetsRenamedInOtherChildProducts.contains { $0.value != aliasInCurChild }
+
+                        if hasConflictingAliasesForTargetsRenamed {
+                            // If conflicting aliases are found, wait until
+                            // all conflicts are found and deleted (in the last
+                            // `else` case), so do nothing for now.
+                        } else if !aliasesForTargetsRenamedInOtherChildProducts.isEmpty,
+                                  !allTargetNamesInCurChildProduct.contains(curTarget.name) {
+                            for (aliasKey, aliasValue) in aliasesForTargetsRenamedInOtherChildProducts {
                                 // Reset the old alias value with this aliasValue
                                 if curTarget.moduleAliases?[aliasKey] != aliasValue {
                                     curTarget.addModuleAlias(for: aliasKey, as: aliasValue)
@@ -221,20 +254,38 @@ class ModuleAliasTracker {
                             // If there are no aliases or conflicting aliases
                             // for the same key defined in other child products,
                             // those aliases should be removed from this target.
-                            let hasConflict = allTargetsInOtherChildProducts.contains{ otherTarget in
+                            let targetsWithConflictingAliases = allTargetsInOtherChildProducts.filter { otherTarget in
                                 if let otherAlias = otherTarget.moduleAliases?[nameToBeAliased] {
-                                    return otherAlias != aliasInChild
+                                    return otherAlias != aliasInCurChild
                                 } else {
                                     return otherTarget.name == nameToBeAliased
                                 }
                             }
-                            if hasConflict {
-                                // If there are aliases, remove as aliasing should
-                                // not be applied
+
+                            if !targetsWithConflictingAliases.isEmpty {
+                                // If there are conflicting aliases, remove them
+                                // and show a diag message
+                                let conflictingAliases = targetsWithConflictingAliases.compactMap { $0.moduleAliases?[nameToBeAliased] }
+                                var message = conflictingAliases.isEmpty ? "Targets named '\(nameToBeAliased)' found in other dependency products;" : "Conflicting module aliases found \(conflictingAliases + [aliasInCurChild]) for '\(nameToBeAliased)'; "
+                                message += "these will be removed from target '\(curTarget.name)'"
+                                observabilityScope.emit(info: message)
+
                                 curTarget.removeModuleAlias(for: nameToBeAliased)
-                            } else if curTarget.moduleAliases?[nameToBeAliased] == nil {
-                                // Otherwise add the alias if none exists
-                                curTarget.addModuleAlias(for: nameToBeAliased, as: aliasInChild)
+                            } else if curTarget.name != nameToBeAliased {
+                                // Targets to be renamed already have aliases, so
+                                // process their depending targets here
+                                if curTarget.moduleAliases?[nameToBeAliased] == nil {
+                                    // Remove any pre-chained aliases, i.e. value
+                                    // of a module alias defined upstream that's used
+                                    // as a key downstream
+                                    let preChainedAliases = curTarget.moduleAliases?.filter{$0.value == aliasInCurChild} ?? [:]
+                                    for preChainedAlias in preChainedAliases {
+                                        if preChainedAlias.key != nameToBeAliased {
+                                            curTarget.removeModuleAlias(for: preChainedAlias.key)
+                                        }
+                                    }
+                                    curTarget.addModuleAlias(for: nameToBeAliased, as: aliasInCurChild)
+                                }
                             }
                         }
                     }
